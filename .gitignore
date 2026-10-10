@@ -1,0 +1,29 @@
+# Gradle / 构建产物
+.gradle/
+build/
+app/build/
+local.properties
+.cxx/
+.externalNativeBuild/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# 真机录音样本（含真人声音，不入库）
+tools/pitch_lab/recordings/
+# 合成测试集（可用 pitch_lab.py synth 重新生成）
+tools/pitch_lab/synth/
+
+# 本机工作区元数据（含设备序列号等本机信息）
+.workbuddy-ai/
