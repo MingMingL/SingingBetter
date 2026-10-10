@@ -37,7 +37,7 @@ final class AudioSession {
     private File lastFile;
     private byte[] lastPcm;
     private long recordingStartedAtMs;
-    private AudioTrack playbackTrack;
+    private Playback activePlayback;
 
     AudioSession(File filesDirectory, Listener listener) {
         this.recordingsDirectory = new File(filesDirectory, "recordings");
@@ -183,33 +183,7 @@ final class AudioSession {
             data[i * 2] = (byte) (tone[i] & 0xff);
             data[i * 2 + 1] = (byte) ((tone[i] >> 8) & 0xff);
         }
-        int minBuffer = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        if (minBuffer <= 0) throw new IOException("设备不支持音频播放");
-        AudioTrack track = new AudioTrack(new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build(), new AudioFormat.Builder()
-                .setSampleRate(SAMPLE_RATE)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build(), Math.max(minBuffer, data.length), AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE);
-        track.write(data, 0, data.length, AudioTrack.WRITE_BLOCKING);
-        track.play();
-        Thread playback = new Thread(() -> {
-            try {
-                while (track.getPlaybackHeadPosition() < tone.length && track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
-                    Thread.sleep(20);
-                }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            } finally {
-                if (track.getState() == AudioTrack.STATE_INITIALIZED) {
-                    try { track.stop(); } catch (IllegalStateException ignored) { }
-                    track.release();
-                }
-            }
-        }, "SingingBetter-ReferenceTone");
-        playback.start();
+        startPlayback(data, "SingingBetter-ReferenceTone");
     }
 
     synchronized void playLast() throws Exception {
@@ -224,9 +198,19 @@ final class AudioSession {
     }
 
     private void playPcm(byte[] data) throws Exception {
+        startPlayback(data, "SingingBetter-AudioPlayback");
+    }
+
+    /**
+     * 起一条静态播放。关键点：AudioTrack 一旦 release，native 指针就失效，
+     * 任何线程再调 getPlaybackHeadPosition()/getPlayState() 都会抛 IllegalStateException
+     * （在子线程里抛 = 进程崩溃）。所以 release 只由回放线程自己在收尾时执行，
+     * 外部要停只能走 Playback.requestStop()，它只调 stop() 并置停止标志。
+     */
+    private void startPlayback(byte[] data, String threadName) throws Exception {
         stopPlayback();
         int minBuffer = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        if (minBuffer <= 0) throw new IOException("设备不支持音频回放");
+        if (minBuffer <= 0) throw new IOException("设备不支持音频播放");
         AudioTrack track = new AudioTrack(new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -237,33 +221,50 @@ final class AudioSession {
                 .build(), Math.max(minBuffer, data.length), AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE);
         track.write(data, 0, data.length, AudioTrack.WRITE_BLOCKING);
         track.play();
-        playbackTrack = track;
+        final Playback playback = new Playback(track);
         final int frames = data.length / 2;
-        Thread playback = new Thread(() -> {
+        synchronized (this) { activePlayback = playback; }
+        Thread worker = new Thread(() -> {
             try {
-                while (track.getPlaybackHeadPosition() < frames && track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+                while (!playback.isStopped()
+                        && track.getPlaybackHeadPosition() < frames
+                        && track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
                     Thread.sleep(30);
                 }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
+            } catch (IllegalStateException alreadyReleased) {
+                // 轨道已被释放（理论上不该发生），直接结束，绝不让异常冒到线程外
             } finally {
                 try { track.stop(); } catch (IllegalStateException ignored) { }
                 track.release();
                 synchronized (AudioSession.this) {
-                    if (playbackTrack == track) playbackTrack = null;
+                    if (activePlayback == playback) activePlayback = null;
                 }
             }
-        }, "SingingBetter-AudioPlayback");
-        playback.start();
+        }, threadName);
+        worker.start();
     }
 
     /** 离开页面或开始新回放前调用，避免多段录音同时出声。 */
     synchronized void stopPlayback() {
-        AudioTrack track = playbackTrack;
-        playbackTrack = null;
-        if (track == null) return;
-        try { track.stop(); } catch (IllegalStateException ignored) { }
-        track.release();
+        Playback playback = activePlayback;
+        activePlayback = null;
+        if (playback != null) playback.requestStop();
+    }
+
+    private static final class Playback {
+        private final AudioTrack track;
+        private volatile boolean stopped;
+
+        Playback(AudioTrack track) { this.track = track; }
+
+        boolean isStopped() { return stopped; }
+
+        void requestStop() {
+            stopped = true;
+            try { track.stop(); } catch (IllegalStateException ignored) { }
+        }
     }
 
     /** 删除录音后调用：若删掉的正是缓存里的那一条，就清掉缓存，避免继续回放到已删除的音频。 */
